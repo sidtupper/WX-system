@@ -42,29 +42,84 @@ bool looksLikePacket(String packet) {
   return isHexDigitString(packet.substring(firstStar + 1));
 }
 
+// Report the actual settings read back from the E22, not just the target values.
+void printE22Config(const char *label, const Configuration &c) {
+  Serial.printf(
+      "%s: addr=%02X:%02X net=%u chan=%u UART=%u parity=%u "
+      "air=%u fixed=%u subpacket=%u RSSI=%u LBT=%u repeat=%u "
+      "crypt=%02X:%02X power-code=%u\n",
+      label, c.ADDH, c.ADDL, c.NETID, c.CHAN,
+      c.SPED.uartBaudRate, c.SPED.uartParity, c.SPED.airDataRate,
+      c.TRANSMISSION_MODE.fixedTransmission,
+      c.OPTION.subPacketSetting, c.TRANSMISSION_MODE.enableRSSI,
+      c.TRANSMISSION_MODE.enableLBT,
+      c.TRANSMISSION_MODE.enableRepeater,
+      c.CRYPT.CRYPT_H, c.CRYPT.CRYPT_L,
+      c.OPTION.transmissionPower);
+}
+
+// All three nodes must have matching RF/packet settings. Preserve
+// transmit power from the existing module configuration (battery budget).
+void normalizeE22Config(Configuration &c, uint8_t addrH, uint8_t addrL,
+                        uint8_t channel) {
+  c.ADDH = addrH;
+  c.ADDL = addrL;
+  c.NETID = 0;
+  c.CHAN = channel;
+  c.SPED.uartBaudRate = UART_BPS_9600;
+  c.SPED.uartParity = MODE_00_8N1;
+  c.SPED.airDataRate = AIR_DATA_RATE_010_24; // 2.4 kbps on air
+  c.OPTION.subPacketSetting = SPS_240_00;
+  c.OPTION.RSSIAmbientNoise = RSSI_AMBIENT_NOISE_DISABLED;
+  c.TRANSMISSION_MODE.fixedTransmission = FT_FIXED_TRANSMISSION;
+  c.TRANSMISSION_MODE.enableRSSI = RSSI_DISABLED;
+  c.TRANSMISSION_MODE.enableLBT = LBT_DISABLED;
+  c.TRANSMISSION_MODE.enableRepeater = REPEATER_DISABLED;
+  c.CRYPT.CRYPT_H = 0;
+  c.CRYPT.CRYPT_L = 0;
+}
+
 bool configureE22() {
-  ResponseStructContainer container = e22.getConfiguration();
-  if (container.status.code != 1) {
-    Serial.printf("E22 getConfiguration error: %d\n", container.status.code);
-    container.close();
+  ResponseStructContainer current = e22.getConfiguration();
+  if (current.status.code != E22_SUCCESS) {
+    Serial.printf("E22 getConfiguration failed: %d (%s)\n",
+                  current.status.code,
+                  current.status.getResponseDescription().c_str());
     return false;
   }
 
-  Configuration configuration = *(Configuration *)container.data;
-  configuration.ADDH = GATEWAY_ADDH;
-  configuration.ADDL = GATEWAY_ADDL;
-  configuration.CHAN = LORA_CHANNEL;
-  configuration.TRANSMISSION_MODE.fixedTransmission = FT_FIXED_TRANSMISSION;
+  Configuration c = *(Configuration *)current.data;
+  printE22Config("E22 before", c);
+  current.close();
 
-  ResponseStatus status =
-      e22.setConfiguration(configuration, WRITE_CFG_PWR_DWN_SAVE);
-  container.close();
-
-  if (status.code != 1) {
-    Serial.printf("E22 setConfiguration error: %d\n", status.code);
+  normalizeE22Config(c, GATEWAY_ADDH, GATEWAY_ADDL, LORA_CHANNEL);
+  ResponseStatus status = e22.setConfiguration(c, WRITE_CFG_PWR_DWN_SAVE);
+  if (status.code != E22_SUCCESS) {
+    Serial.printf("E22 setConfiguration failed: %d (%s)\n",
+                  status.code, status.getResponseDescription().c_str());
     return false;
   }
-  return true;
+
+  ResponseStructContainer check = e22.getConfiguration();
+  if (check.status.code != E22_SUCCESS) {
+    Serial.printf("E22 readback failed: %d (%s)\n",
+                  check.status.code,
+                  check.status.getResponseDescription().c_str());
+    return false;
+  }
+  Configuration actual = *(Configuration *)check.data;
+  printE22Config("E22 actual", actual);
+  check.close();
+
+  bool ok = (actual.ADDH == GATEWAY_ADDH && actual.ADDL == GATEWAY_ADDL
+          && actual.CHAN == LORA_CHANNEL && actual.NETID == 0
+          && actual.SPED.uartBaudRate == UART_BPS_9600
+          && actual.SPED.airDataRate == AIR_DATA_RATE_010_24
+          && actual.SPED.uartParity == MODE_00_8N1
+          && actual.TRANSMISSION_MODE.fixedTransmission == FT_FIXED_TRANSMISSION
+          && actual.CRYPT.CRYPT_H == 0 && actual.CRYPT.CRYPT_L == 0);
+  Serial.println(ok ? "E22 configuration VERIFIED" : "ERROR: E22 readback mismatch");
+  return ok;
 }
 
 void setup() {
@@ -73,9 +128,9 @@ void setup() {
 
   GWSerial.begin(9600, SERIAL_8N1, GW_RX, GW_TX);
   LoraSerial.begin(9600, SERIAL_8N1, LORA_RX, LORA_TX);
-  e22.begin();
-
-  if (!configureE22()) {
+  if (!e22.begin()) {
+    Serial.println("ERROR: E22 begin failed");
+  } else if (!configureE22()) {
     Serial.println("WARNING: E22 configuration failed");
   }
 
