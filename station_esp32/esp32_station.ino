@@ -1,3 +1,5 @@
+// WX-system station — E22 safe-start diagnostics, 2026-11-04
+// Unverified candidate; compile and bench-test before deployment.
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_LTR390.h>
@@ -64,6 +66,8 @@ constexpr uint8_t STATION_ADDL  = 0x01;
 constexpr uint8_t MIDPOINT_ADDH = 0x00;
 constexpr uint8_t MIDPOINT_ADDL = 0x02;
 constexpr uint8_t LORA_CHANNEL  = 23;
+
+bool e22Ready = false; // True only after configuration readback matches.
 
 char rxLine[RX_BUF_SIZE];
 
@@ -294,6 +298,10 @@ bool configureE22() {
     return false;
   }
 
+  if (current.data == nullptr) {
+    Serial.println("ERROR: E22 returned an empty configuration buffer");
+    return false;
+  }
   Configuration c = *(Configuration *)current.data;
   printE22Config("E22 before", c);
   current.close();
@@ -313,6 +321,10 @@ bool configureE22() {
                   check.status.getResponseDescription().c_str());
     return false;
   }
+  if (check.data == nullptr) {
+    Serial.println("ERROR: E22 returned an empty configuration buffer");
+    return false;
+  }
   Configuration actual = *(Configuration *)check.data;
   printE22Config("E22 actual", actual);
   check.close();
@@ -322,8 +334,15 @@ bool configureE22() {
           && actual.SPED.uartBaudRate == UART_BPS_9600
           && actual.SPED.airDataRate == AIR_DATA_RATE_010_24
           && actual.SPED.uartParity == MODE_00_8N1
+          && actual.OPTION.subPacketSetting == SPS_240_00
+          && actual.OPTION.RSSIAmbientNoise == RSSI_AMBIENT_NOISE_DISABLED
+          && actual.TRANSMISSION_MODE.enableRSSI == RSSI_DISABLED
+          && actual.TRANSMISSION_MODE.enableLBT == LBT_DISABLED
+          && actual.TRANSMISSION_MODE.enableRepeater == REPEATER_DISABLED
           && actual.TRANSMISSION_MODE.fixedTransmission == FT_FIXED_TRANSMISSION
           && actual.CRYPT.CRYPT_H == 0 && actual.CRYPT.CRYPT_L == 0);
+  Serial.println("E22 expected RF link: 9600 8N1 UART; 2.4 kbps air; "
+                 "channel 23; NETID 0; fixed mode; key 0000");
   Serial.println(ok ? "E22 configuration VERIFIED" : "ERROR: E22 readback mismatch");
   return ok;
 }
@@ -395,12 +414,16 @@ void setup() {
       LORA_TX
   );
 
-  if (!e22.begin()) {
-    Serial.println("E22 begin failed");
-  } else if (!configureE22()) {
-    Serial.println("E22 configuration failed");
+  const bool beginOK = e22.begin();
+  Serial.printf("E22 begin: %s\n", beginOK ? "OK (not proof of radio)" : "FAILED");
+  Serial.printf("E22 GPIO after begin: AUX=%d M0=%d M1=%d\n",
+                digitalRead(LORA_AUX), digitalRead(LORA_M0), digitalRead(LORA_M1));
+  if (beginOK) e22Ready = configureE22();
+  if (e22Ready) {
+    Serial.println("Station E22 VERIFIED; fixed transmission enabled");
   } else {
-    Serial.println("E22 ready");
+    Serial.println("Station E22 OFFLINE: RF transmission disabled."
+                   " Expected with bare ESP32; AUX level is meaningless without a radio.");
   }
 
   Serial.println("Waiting for Pi weather packets");
@@ -443,6 +466,11 @@ void loop() {
       piBody + "," + String(uv) + "," + String(al);
 
   const String outgoingPacket = makePacket(outgoingBody);
+
+  if (!e22Ready) {
+    Serial.println("E22 OFFLINE: valid Pi packet processed but NOT transmitted");
+    return;
+  }
 
   ResponseStatus status = e22.sendFixedMessage(
       MIDPOINT_ADDH,

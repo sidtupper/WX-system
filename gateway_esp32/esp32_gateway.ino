@@ -1,3 +1,5 @@
+// WX-system gateway — E22 safe-start diagnostics, 2026-11-04
+// Unverified candidate; compile and bench-test before deployment.
 #include <Arduino.h>
 #include "LoRa_E22.h"
 
@@ -20,6 +22,8 @@ LoRa_E22 e22(&LoraSerial, LORA_AUX, LORA_M0, LORA_M1,
 constexpr uint8_t GATEWAY_ADDH = 0x00;
 constexpr uint8_t GATEWAY_ADDL = 0x03;
 constexpr uint8_t LORA_CHANNEL = 23;
+bool e22Ready = false; // True only after configuration readback matches.
+
 constexpr size_t MAX_PACKET_CHARS = 220;
 
 bool isHexDigitString(const String &text) {
@@ -88,6 +92,10 @@ bool configureE22() {
     return false;
   }
 
+  if (current.data == nullptr) {
+    Serial.println("ERROR: E22 returned an empty configuration buffer");
+    return false;
+  }
   Configuration c = *(Configuration *)current.data;
   printE22Config("E22 before", c);
   current.close();
@@ -107,6 +115,10 @@ bool configureE22() {
                   check.status.getResponseDescription().c_str());
     return false;
   }
+  if (check.data == nullptr) {
+    Serial.println("ERROR: E22 returned an empty configuration buffer");
+    return false;
+  }
   Configuration actual = *(Configuration *)check.data;
   printE22Config("E22 actual", actual);
   check.close();
@@ -116,8 +128,15 @@ bool configureE22() {
           && actual.SPED.uartBaudRate == UART_BPS_9600
           && actual.SPED.airDataRate == AIR_DATA_RATE_010_24
           && actual.SPED.uartParity == MODE_00_8N1
+          && actual.OPTION.subPacketSetting == SPS_240_00
+          && actual.OPTION.RSSIAmbientNoise == RSSI_AMBIENT_NOISE_DISABLED
+          && actual.TRANSMISSION_MODE.enableRSSI == RSSI_DISABLED
+          && actual.TRANSMISSION_MODE.enableLBT == LBT_DISABLED
+          && actual.TRANSMISSION_MODE.enableRepeater == REPEATER_DISABLED
           && actual.TRANSMISSION_MODE.fixedTransmission == FT_FIXED_TRANSMISSION
           && actual.CRYPT.CRYPT_H == 0 && actual.CRYPT.CRYPT_L == 0);
+  Serial.println("E22 expected RF link: 9600 8N1 UART; 2.4 kbps air; "
+                 "channel 23; NETID 0; fixed mode; key 0000");
   Serial.println(ok ? "E22 configuration VERIFIED" : "ERROR: E22 readback mismatch");
   return ok;
 }
@@ -128,16 +147,25 @@ void setup() {
 
   GWSerial.begin(9600, SERIAL_8N1, GW_RX, GW_TX);
   LoraSerial.begin(9600, SERIAL_8N1, LORA_RX, LORA_TX);
-  if (!e22.begin()) {
-    Serial.println("ERROR: E22 begin failed");
-  } else if (!configureE22()) {
-    Serial.println("WARNING: E22 configuration failed");
+  const bool beginOK = e22.begin();
+  Serial.printf("E22 begin: %s\n", beginOK ? "OK (not proof of radio)" : "FAILED");
+  Serial.printf("E22 GPIO after begin: AUX=%d M0=%d M1=%d\n",
+                digitalRead(LORA_AUX), digitalRead(LORA_M0), digitalRead(LORA_M1));
+  if (beginOK) e22Ready = configureE22();
+  if (e22Ready) {
+    Serial.println("Gateway E22 VERIFIED; receiver enabled");
+  } else {
+    Serial.println("Gateway E22 OFFLINE: RF receive disabled."
+                   " Expected with bare ESP32; AUX level is meaningless without a radio.");
   }
-
-  Serial.println("Gateway fixed-address receiver ready");
+  Serial.println("Gateway application running");
 }
 
 void loop() {
+  if (!e22Ready) {
+    delay(100);
+    return;
+  }
   if (!e22.available()) {
     delay(1);
     return;
