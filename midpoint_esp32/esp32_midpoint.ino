@@ -1,9 +1,10 @@
-// WX-system midpoint — E22 safe-start diagnostics, 2026-11-04
-// Unverified candidate; compile and bench-test before deployment.
+// WX-system midpoint -- direct-UART E22 production integration candidate, 2026-11-09
+// Derived from successful three-node fixed-address RF bench test.
+// NOT field validated; battery monitor and charger logic retained.
 #include <Arduino.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include "LoRa_E22.h"
+
 
 // ============================================================
 // MIDPOINT RELAY - PRODUCTION CANDIDATE
@@ -44,7 +45,7 @@ constexpr uint8_t MIDPOINT_ADDH = 0x00;
 constexpr uint8_t MIDPOINT_ADDL = 0x02;
 constexpr uint8_t GATEWAY_ADDH  = 0x00;
 constexpr uint8_t GATEWAY_ADDL  = 0x03;
-constexpr uint8_t LORA_CHANNEL = 23;
+constexpr uint8_t LORA_CHANNEL = 60; // Bench-verified: 910.125 MHz
 
 
 // ---------------- Charger -----------------------------------
@@ -90,10 +91,10 @@ constexpr uint32_t TEMP_CHECK_INTERVAL_MS = 60000;
 // ---------------- Objects -----------------------------------
 
 HardwareSerial E22Serial(2);
-LoRa_E22 e22(&E22Serial, LORA_AUX, LORA_M0, LORA_M1,
-             UART_BPS_RATE_9600);
 
-bool e22Ready = false; // True only after configuration readback matches.
+
+constexpr uint8_t E22_LOCAL_ADDRESS = MIDPOINT_ADDL;
+bool e22Ready = false; // True only when raw UART config verifies.
 
 OneWire oneWire(DS18B20_PIN);
 DallasTemperature temperatureSensor(&oneWire);
@@ -350,103 +351,176 @@ void checkChargingTemperature()
 }
 
 
-// ============================================================
-// E22
-// ============================================================
 
-// Report the actual settings read back from the E22, not just the target values.
-void printE22Config(const char *label, const Configuration &c) {
-  Serial.printf(
-      "%s: addr=%02X:%02X net=%u chan=%u UART=%u parity=%u "
-      "air=%u fixed=%u subpacket=%u RSSI=%u LBT=%u repeat=%u "
-      "crypt=%02X:%02X power-code=%u\n",
-      label, c.ADDH, c.ADDL, c.NETID, c.CHAN,
-      c.SPED.uartBaudRate, c.SPED.uartParity, c.SPED.airDataRate,
-      c.TRANSMISSION_MODE.fixedTransmission,
-      c.OPTION.subPacketSetting, c.TRANSMISSION_MODE.enableRSSI,
-      c.TRANSMISSION_MODE.enableLBT,
-      c.TRANSMISSION_MODE.enableRepeater,
-      c.CRYPT.CRYPT_H, c.CRYPT.CRYPT_L,
-      c.OPTION.transmissionPower);
+// ============================================================
+// E22 DIRECT UART DRIVER - based on VERIFIED 3-node bench test
+// No xreef LoRa_E22 library. C2 is temporary and re-applied at boot.
+// ============================================================
+constexpr uint8_t E22_SPEED = 0x62;      // 9600 8N1 UART; 2.4 kbps RF
+constexpr uint8_t E22_OPTION = 0x03;     // 240-byte subpacket, lowest TX power
+constexpr uint8_t E22_MODE = 0x43;       // fixed addressing; normal RX/TX
+constexpr uint32_t E22_REPLY_TIMEOUT_MS = 1500;
+constexpr uint32_t E22_RETRY_MS = 30000;
+uint32_t lastE22Attempt = 0;
+
+bool waitE22Aux(uint32_t timeoutMs) {
+  const uint32_t started = millis();
+  do {
+    if (digitalRead(LORA_AUX) == HIGH) return true;
+    delay(5);
+  } while (millis() - started < timeoutMs);
+  return false;
 }
 
-// All three nodes must have matching RF/packet settings. Preserve
-// transmit power from the existing module configuration (battery budget).
-void normalizeE22Config(Configuration &c, uint8_t addrH, uint8_t addrL,
-                        uint8_t channel) {
-  c.ADDH = addrH;
-  c.ADDL = addrL;
-  c.NETID = 0;
-  c.CHAN = channel;
-  c.SPED.uartBaudRate = UART_BPS_9600;
-  c.SPED.uartParity = MODE_00_8N1;
-  c.SPED.airDataRate = AIR_DATA_RATE_010_24; // 2.4 kbps on air
-  c.OPTION.subPacketSetting = SPS_240_00;
-  c.OPTION.RSSIAmbientNoise = RSSI_AMBIENT_NOISE_DISABLED;
-  c.TRANSMISSION_MODE.fixedTransmission = FT_FIXED_TRANSMISSION;
-  c.TRANSMISSION_MODE.enableRSSI = RSSI_DISABLED;
-  c.TRANSMISSION_MODE.enableLBT = LBT_DISABLED;
-  c.TRANSMISSION_MODE.enableRepeater = REPEATER_DISABLED;
-  c.CRYPT.CRYPT_H = 0;
-  c.CRYPT.CRYPT_L = 0;
+bool setE22Mode(bool configuration) {
+  digitalWrite(LORA_M0, LOW);
+  digitalWrite(LORA_M1, configuration ? HIGH : LOW);
+  delay(150);
+  bool ok = waitE22Aux(3000);
+  Serial.printf("E22 %s mode M0=%d M1=%d AUX=%d ready=%s\n",
+                configuration ? "CONFIG" : "NORMAL",
+                digitalRead(LORA_M0), digitalRead(LORA_M1),
+                digitalRead(LORA_AUX), ok ? "YES" : "NO");
+  return ok;
+}
+
+void printE22Reply(const char *label, const uint8_t *buffer, size_t n) {
+  Serial.printf("%s RX %u/12:", label, (unsigned)n);
+  for (size_t i = 0; i < n; ++i) Serial.printf(" %02X", buffer[i]);
+  Serial.println();
+}
+
+bool e22Transaction(const char *label, const uint8_t *request,
+                    size_t reqLen, uint8_t response[12]) {
+  // Only called in configuration mode; drain stale radio-UART bytes.
+  while (E22Serial.available()) (void)E22Serial.read();
+  Serial.printf("%s TX:", label);
+  for (size_t i = 0; i < reqLen; ++i) Serial.printf(" %02X", request[i]);
+  Serial.println();
+  E22Serial.write(request, reqLen);
+  E22Serial.flush();
+  size_t received = 0;
+  const uint32_t started = millis();
+  while (millis() - started < E22_REPLY_TIMEOUT_MS && received < 12) {
+    while (E22Serial.available() && received < 12)
+      response[received++] = (uint8_t)E22Serial.read();
+    if (received < 12) delay(1);
+  }
+  printE22Reply(label, response, received);
+  return received == 12 && response[0] == 0xC1 &&
+         response[1] == 0x00 && response[2] == 0x09;
+}
+
+bool readE22Configuration(const char *label, uint8_t response[12]) {
+  const uint8_t request[] = {0xC1, 0x00, 0x09};
+  for (uint8_t attempt = 1; attempt <= 3; ++attempt) {
+    if (!waitE22Aux(1500)) Serial.println("WARN: E22 AUX LOW before read");
+    if (e22Transaction(label, request, sizeof(request), response)) return true;
+    Serial.printf("E22 configuration read attempt %u failed\n", attempt);
+    delay(200);
+  }
+  return false;
 }
 
 bool configureE22() {
-  ResponseStructContainer current = e22.getConfiguration();
-  if (current.status.code != E22_SUCCESS) {
-    Serial.printf("E22 getConfiguration failed: %d (%s)\n",
-                  current.status.code,
-                  current.status.getResponseDescription().c_str());
-    // Library may return before allocating a data buffer on failure.
-    return false;
-  }
-  if (current.data == nullptr) {
-    Serial.println("ERROR: E22 returned an empty configuration buffer");
-    return false;
-  }
-  Configuration c = *(Configuration *)current.data;
-  printE22Config("E22 before", c);
-  current.close();
-
-  normalizeE22Config(c, MIDPOINT_ADDH, MIDPOINT_ADDL, LORA_CHANNEL);
-  ResponseStatus status = e22.setConfiguration(c, WRITE_CFG_PWR_DWN_SAVE);
-  if (status.code != E22_SUCCESS) {
-    Serial.printf("E22 setConfiguration failed: %d (%s)\n",
-                  status.code, status.getResponseDescription().c_str());
+  if (!setE22Mode(true)) {
+    Serial.println("ERROR: E22 did not enter configuration mode");
+    (void)setE22Mode(false);
     return false;
   }
 
-  ResponseStructContainer check = e22.getConfiguration();
-  if (check.status.code != E22_SUCCESS) {
-    Serial.printf("E22 readback failed: %d (%s)\n",
-                  check.status.code,
-                  check.status.getResponseDescription().c_str());
-    // Do not free a potentially uninitialized pointer on early failure.
+  uint8_t before[12] = {};
+  if (!readE22Configuration("READ_BEFORE", before)) {
+    Serial.println("ERROR: no valid E22 configuration response");
+    (void)setE22Mode(false);
     return false;
   }
-  if (check.data == nullptr) {
-    Serial.println("ERROR: E22 returned an empty configuration buffer");
+  Serial.printf("E22 BEFORE: addr=%02X:%02X net=%u speed=%02X option=%02X "
+                "channel=%u mode=%02X\n",
+                before[3], before[4], before[5], before[6],
+                before[7], before[8], before[9]);
+
+  const uint8_t config[] = {
+      0xC2, 0x00, 0x09,  // temporary configuration (not flash/EEPROM)
+      0x00, E22_LOCAL_ADDRESS, 0x00,
+      E22_SPEED, E22_OPTION, LORA_CHANNEL, E22_MODE, 0x00, 0x00
+  };
+  uint8_t acknowledgement[12] = {};
+  if (!e22Transaction("WRITE_TEMP", config, sizeof(config), acknowledgement)) {
+    Serial.println("ERROR: E22 configuration write not acknowledged");
+    (void)setE22Mode(false);
     return false;
   }
-  Configuration actual = *(Configuration *)check.data;
-  printE22Config("E22 actual", actual);
-  check.close();
-  bool ok = (actual.ADDH == MIDPOINT_ADDH && actual.ADDL == MIDPOINT_ADDL
-          && actual.CHAN == LORA_CHANNEL && actual.NETID == 0
-          && actual.SPED.uartBaudRate == UART_BPS_9600
-          && actual.SPED.uartParity == MODE_00_8N1
-          && actual.SPED.airDataRate == AIR_DATA_RATE_010_24
-          && actual.OPTION.subPacketSetting == SPS_240_00
-          && actual.OPTION.RSSIAmbientNoise == RSSI_AMBIENT_NOISE_DISABLED
-          && actual.TRANSMISSION_MODE.enableRSSI == RSSI_DISABLED
-          && actual.TRANSMISSION_MODE.enableLBT == LBT_DISABLED
-          && actual.TRANSMISSION_MODE.enableRepeater == REPEATER_DISABLED
-          && actual.TRANSMISSION_MODE.fixedTransmission == FT_FIXED_TRANSMISSION
-          && actual.CRYPT.CRYPT_H == 0 && actual.CRYPT.CRYPT_L == 0);
-  Serial.println("E22 expected RF link: 9600 8N1 UART; 2.4 kbps air; "
-                 "channel 23; NETID 0; fixed mode; key 0000");
-  Serial.println(ok ? "E22 configuration VERIFIED" : "ERROR: E22 readback mismatch");
-  return ok;
+  delay(120);
+
+  uint8_t after[12] = {};
+  if (!readE22Configuration("READ_AFTER", after)) {
+    Serial.println("ERROR: E22 configuration readback failed");
+    (void)setE22Mode(false);
+    return false;
+  }
+  Serial.printf("E22 AFTER: addr=%02X:%02X net=%u speed=%02X option=%02X "
+                "channel=%u mode=%02X crypt=%02X:%02X\n",
+                after[3], after[4], after[5], after[6], after[7],
+                after[8], after[9], after[10], after[11]);
+  const bool verified = after[3] == 0x00 &&
+      after[4] == E22_LOCAL_ADDRESS && after[5] == 0x00 &&
+      after[6] == E22_SPEED && after[7] == E22_OPTION &&
+      after[8] == LORA_CHANNEL && after[9] == E22_MODE &&
+      after[10] == 0x00 && after[11] == 0x00;
+
+  if (!verified) Serial.println("ERROR: E22 configuration mismatch");
+  const bool normal = setE22Mode(false);
+  if (verified && normal)
+    Serial.printf("CONFIG VERIFIED: addr=00:%02X channel=%u fixed mode\n",
+                  E22_LOCAL_ADDRESS, LORA_CHANNEL);
+  return verified && normal;
+}
+
+void startE22() {
+  pinMode(LORA_M0, OUTPUT);
+  pinMode(LORA_M1, OUTPUT);
+  digitalWrite(LORA_M0, LOW);
+  digitalWrite(LORA_M1, LOW);
+  pinMode(LORA_AUX, INPUT);
+  E22Serial.begin(9600, SERIAL_8N1, LORA_RX, LORA_TX);
+  lastE22Attempt = millis();
+  e22Ready = configureE22();
+  Serial.println(e22Ready ? "E22 RF ENABLED" : "E22 RF OFFLINE; will retry");
+}
+
+void retryE22IfOffline() {
+  if (e22Ready || (uint32_t)(millis() - lastE22Attempt) < E22_RETRY_MS)
+    return;
+  lastE22Attempt = millis();
+  Serial.println("Retrying E22 configuration...");
+  e22Ready = configureE22();
+  Serial.println(e22Ready ? "E22 RF ENABLED" : "E22 RF OFFLINE");
+}
+
+bool sendE22Fixed(uint8_t destLow, const String &payload) {
+  if (!e22Ready) return false;
+  // E22 currently configured for 240-byte subpackets.
+  if (payload.length() + 3 > 240) {
+    Serial.println("ERROR: E22 payload exceeds one radio subpacket");
+    return false;
+  }
+  if (!waitE22Aux(3000)) {
+    Serial.println("ERROR: E22 AUX stayed LOW before TX");
+    return false;
+  }
+  const uint8_t header[] = {0x00, destLow, LORA_CHANNEL};
+  const size_t headWritten = E22Serial.write(header, sizeof(header));
+  const size_t bodyWritten = E22Serial.write(
+      reinterpret_cast<const uint8_t *>(payload.c_str()), payload.length());
+  E22Serial.flush();
+  const bool queued = headWritten == sizeof(header) &&
+                      bodyWritten == payload.length();
+  Serial.printf("E22 UART TX 00:%02X CH=%u bytes=%u %s\n",
+                destLow, LORA_CHANNEL, (unsigned)payload.length(),
+                queued ? "QUEUED" : "FAILED");
+  // QUEUED means written to UART, not confirmed over-the-air delivery.
+  return queued;
 }
 
 // Print even binary junk in a way that can be compared with packets.
@@ -509,13 +583,9 @@ bool receivePacket(String &packet)
 
 bool forwardPacket(const String &packet)
 {
-    // FIXED mode adds address/channel on the E22 UART input; the radio
-    // strips that routing header before delivering the receiver payload.
-    ResponseStatus status = e22.sendFixedMessage(
-        GATEWAY_ADDH, GATEWAY_ADDL, LORA_CHANNEL, packet);
-    Serial.printf("E22 midpoint->gateway TX: %d (%s)\n",
-                  status.code, status.getResponseDescription().c_str());
-    return status.code == E22_SUCCESS;
+    // Forward as one newline-terminated frame for gateway parsing.
+    // A UART queue success alone is NOT proof of gateway receipt.
+    return sendE22Fixed(GATEWAY_ADDL, packet + "\r\n");
 }
 
 // ============================================================
@@ -539,15 +609,8 @@ void setup()
     // Charger defaults OFF until temperature is verified.
     // --------------------------------------------------------
 
-    pinMode(
-        CHARGE_CONTROL,
-        OUTPUT
-    );
-
-    digitalWrite(
-        CHARGE_CONTROL,
-        CHARGE_INHIBIT
-    );
+    digitalWrite(CHARGE_CONTROL, CHARGE_INHIBIT);
+    pinMode(CHARGE_CONTROL, OUTPUT);
 
     // --------------------------------------------------------
     // Battery ADC
@@ -582,18 +645,7 @@ void setup()
     // E22 (uses actual midpoint AUX on GPIO4, DS18B20 on GPIO18)
     // --------------------------------------------------------
 
-    E22Serial.begin(9600, SERIAL_8N1, LORA_RX, LORA_TX);
-    const bool beginOK = e22.begin();
-    Serial.printf("E22 begin: %s\n", beginOK ? "OK (not proof of radio)" : "FAILED");
-    Serial.printf("E22 GPIO after begin: AUX=%d M0=%d M1=%d\n",
-                  digitalRead(LORA_AUX), digitalRead(LORA_M0), digitalRead(LORA_M1));
-    if (beginOK) e22Ready = configureE22();
-    if (e22Ready) {
-        Serial.println("Midpoint E22 VERIFIED; listening in normal mode");
-    } else {
-        Serial.println("Midpoint E22 OFFLINE: RF receive/forward disabled."
-                       " Expected with bare ESP32; AUX level is meaningless without a radio.");
-    }
+    startE22();
 
     Serial.println("Midpoint application running");
 }
@@ -605,6 +657,7 @@ void setup()
 
 void loop()
 {
+    retryE22IfOffline();
     // --------------------------------------------------------
     // Periodic temperature / charger control
     // --------------------------------------------------------
@@ -713,7 +766,7 @@ void loop()
     if (forwardPacket(outgoing)) {
 
         Serial.println(
-            "Forward complete"
+            "Forward queued on radio UART (not gateway ACK)"
         );
 
     } else {
