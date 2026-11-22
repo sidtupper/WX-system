@@ -248,8 +248,25 @@ WeeWX is configured to generate reports under:
 /home/pi/weewx-data/public_html
 ```
 
-The mechanism connecting the WeeWX report directory to the Apache document root must be verified and documented before treating this snapshot as a complete restoration procedure.
+Apache serves the WeeWX-generated weather reports directly from:
 
+`/home/pi/weewx-data/public_html`
+
+The Apache virtual host configuration specifies:
+
+```apache
+DocumentRoot /home/pi/weewx-data/public_html
+
+<Directory /home/pi/weewx-data/public_html>
+    Options FollowSymLinks
+    AllowOverride None
+    Require all granted
+</Directory>
+```
+
+This configuration was verified on November 21, 2026. A request to `http://localhost/` returned exactly the same number of bytes as the WeeWX-generated `index.html` (17,863 bytes).
+
+Apache serves the reports directly; no periodic file copying or symbolic link is required.
 ## 8. systemd services
 
 Service definitions are preserved in:
@@ -367,7 +384,6 @@ Outstanding work includes:
 - Verifying operation with real weather station data.
 - Confirming GPS time synchronization.
 - Confirming rainfall interpretation.
-- Verifying the complete Apache-to-WeeWX HTML reporting path.
 - Testing long-term unattended operation.
 - Recording exact installed software versions.
 - Completing and testing a fresh-install restoration procedure.
