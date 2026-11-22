@@ -1,0 +1,21 @@
+[Unit]
+Description=WX-system LoRa Weather Gateway
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+SupplementaryGroups=dialout
+WorkingDirectory=/home/pi/WX-system/gateway
+
+ExecStart=/home/pi/env/bin/python /home/pi/WX-system/gateway/gateway.py --port /dev/serial0 --baud 9600 --low-relay-battery 3.0
+
+Restart=on-failure
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

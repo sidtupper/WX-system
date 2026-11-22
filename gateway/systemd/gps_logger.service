@@ -1,0 +1,16 @@
+[Unit]
+Description=GPS Logger and LED Indicator Service
+After=network.target
+
+[Service]
+# Path to your virtual environment's python and your script
+ExecStart=/home/pi/env/bin/python /home/pi/gps_reader.py
+WorkingDirectory=/home/pi/
+StandardOutput=inherit
+StandardError=inherit
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
