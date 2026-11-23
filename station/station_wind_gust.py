@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import logging
 import math
+import threading
 from collections import deque
 import signal
 import sys
@@ -19,6 +20,7 @@ import serial
 from typing import Optional, Tuple
 from ina226 import INA226
 from stationio.ili9488 import ILI9488
+from wind_timing import UTCWindSampler
 
 # ============================================================
 # Default configuration values
@@ -755,7 +757,7 @@ def main() -> int:
 
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUD)
 
-    parser.add_argument("--interval", type=float,
+    parser.add_argument("--interval", type=int,
                         default=DEFAULT_INTERVAL)
 
     parser.add_argument("--wind-sample-interval", type=float,
@@ -784,8 +786,10 @@ def main() -> int:
     )
 
     args = parser.parse_args()
-    if args.interval <= 0 or args.wind_sample_interval <= 0:
-        parser.error("intervals must be positive")
+    if args.interval <= 0 or 86400 % args.interval:
+        parser.error("--interval must be a positive divisor of 86400 for UTC alignment")
+    if args.wind_sample_interval <= 0:
+        parser.error("--wind-sample-interval must be positive")
     if args.wind_sample_interval * GUST_WINDOW_SAMPLES > args.interval:
         parser.error("report interval must be at least 3 wind sample intervals")
 
@@ -814,6 +818,7 @@ def main() -> int:
 
     rs485 = None
     esp32 = None
+    sampler = None
 
     failed_cycles = 0
 
@@ -865,56 +870,43 @@ def main() -> int:
 
         log.info("station.py started")
 
-        # Start a full reporting window instead of sending a partial gust
-        # at startup. monotonic() is not affected by GPS/NTP clock changes.
-        wind_accumulator = WindAccumulator(args.wind_sample_interval)
-        start_time = time.monotonic()
-        next_wind = start_time
-        next_poll = start_time + args.interval
-        log.info("Sampling wind every %.2fs, sending every %.1fs",
+        # Independent wind thread continues polling while main thread handles
+        # rain, 1-Wire, display and ESP32 transmission. Both Modbus clients
+        # serialize RS-485 transactions through the same bus lock.
+        bus_lock = threading.Lock()
+        sampler = UTCWindSampler(
+            sensor=wind_sensor,
+            accumulator_factory=lambda: WindAccumulator(args.wind_sample_interval),
+            bus_lock=bus_lock,
+            interval=args.interval,
+            sample_interval=args.wind_sample_interval,
+            logger=log,
+        )
+        sampler.start()
+        log.info("Wind sampling %.2fs; UTC report boundaries every %ds",
                  args.wind_sample_interval, args.interval)
 
-        # Only this main loop accesses the RS-485 bus, avoiding collisions.
         while not stop.stop:
-            now = time.monotonic()
-            if now >= next_wind:
-                try:
-                    observation = wind_sensor.read_all()
-                    wind_accumulator.add(observation, time.monotonic())
-                except Exception as exc:
-                    log.warning("Wind sample failed: %s", exc)
-                # Advance schedule without scheduling a burst of catch-up reads.
-                next_wind += args.wind_sample_interval
-                if next_wind <= time.monotonic():
-                    next_wind = time.monotonic() + args.wind_sample_interval
-
-            now = time.monotonic()
-            if now < next_poll:
-                time.sleep(min(0.10, max(0.0, min(next_wind, next_poll) - now)))
+            completed = sampler.get(timeout=0.2)
+            if completed is None:
                 continue
-
-            # Advance the report schedule regardless of other sensor errors.
-            next_poll += args.interval
-            if next_poll <= now:
-                next_poll = now + args.interval
+            interval_epoch, wind_accumulator = completed
 
             try:
                 wind = wind_accumulator.result()
-                log.info("Wind: %d samples, mean %.2f m/s, "
-                         "max 3-second gust %.2f m/s, peak sample %.2f m/s",
-                         wind_accumulator.count, wind.speed_m_s,
-                         wind.gust_m_s, wind_accumulator.peak_sample)
+                log.info("UTC interval ending %d: %d wind samples, "
+                         "mean %.2f m/s, 3-s gust %.2f m/s",
+                         interval_epoch, wind_accumulator.count,
+                         wind.speed_m_s, wind.gust_m_s)
                 if wind_accumulator.count < 0.9 * (args.interval / args.wind_sample_interval):
                     log.warning("Low wind sample coverage: %d successful polls",
                                 wind_accumulator.count)
-                # Begin accumulating the next 10-minute window. The
-                # calculation was completed before other slower sensor reads.
-                wind_accumulator.reset()
 
                 # Small delay between Modbus requests
                 time.sleep(0.05)
 
-                rain = rain_sensor.read_all()
+                with bus_lock:
+                    rain = rain_sensor.read_all()
 
                 # ------------------------------------------------
                 # Read optional DS18B20 temperatures
@@ -966,7 +958,7 @@ def main() -> int:
                 # ------------------------------------------------
 
                 payload = build_payload(
-                    epoch=int(time.time()),
+                    epoch=interval_epoch,
                     wind=wind,
                     rain=rain,
                     sea_temperature_c=sea_temp,
@@ -1022,6 +1014,9 @@ def main() -> int:
         return 0
 
     finally:
+
+        if sampler is not None:
+            sampler.stop()
 
         # ----------------------------------------------------
         # Clean serial shutdown
