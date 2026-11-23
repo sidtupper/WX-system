@@ -15,11 +15,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 from datetime import datetime
-from PIL import Image, ImageDraw, ImageFont
-import serial
 from typing import Optional, Tuple
-from ina226 import INA226
-from stationio.ili9488 import ILI9488
 from wind_timing import UTCWindSampler
 
 # ============================================================
@@ -51,17 +47,9 @@ GUST_WINDOW_SAMPLES = 3  # 3 samples at 1 Hz = approximately 3 seconds
 INA_ADDRESS = 0x40
 SHUNT_OHMS = 0.0275                 # calibrated with DMM
 
-ina = INA226(
-    shunt_ohms=SHUNT_OHMS,
-    max_expected_amps=0.8,
-    address=INA_ADDRESS,
-)
-ina.configure()
-
-# tft display
-tft = ILI9488(rotation=0, spi_speed_hz=4_000_000)
-tft.setup()
-
+# Hardware initialized only in non-simulation mode.
+ina = None
+tft = None
 
 # ============================================================
 # CRC helper functions
@@ -556,6 +544,8 @@ def update_tft_display(tft, wx, station_battery):
     door is closed and the display is dark.
     """
 
+    from PIL import Image, ImageDraw, ImageFont
+
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     image = Image.new("RGB", (480, 320), "black")
@@ -731,6 +721,8 @@ def open_serial(
     Open and configure a serial port.
     """
 
+    import serial
+
     return serial.Serial(
         port=port,
         baudrate=baud,
@@ -740,6 +732,35 @@ def open_serial(
         timeout=timeout,
         write_timeout=timeout,
     )
+
+
+class SimulatedWindSensor:
+    def __init__(self):
+        self.count = 0
+    def read_all(self) -> WindReading:
+        self.count += 1
+        speed = 8.0 if self.count % 20 in (10, 11, 12) else 5.0
+        return WindReading(speed, 270.0, speed, 12.5, 72.0, 1013.2)
+
+
+class SimulatedRainSensor:
+    def read_all(self) -> RainReading:
+        return RainReading(0.0)
+
+
+class PacketFile:
+    def __init__(self, path):
+        self.port, self.baudrate, self.is_open = path, 0, True
+        self._file = open(path, "w", encoding="ascii")
+    def write(self, data):
+        self._file.write(data.decode("ascii"))
+        return len(data)
+    def flush(self):
+        self._file.flush()
+    def close(self):
+        if self.is_open:
+            self._file.close()
+            self.is_open = False
 
 
 def main() -> int:
@@ -752,6 +773,12 @@ def main() -> int:
         description="Pi 4 weather station sender using native UARTs."
     )
 
+    parser.add_argument("--simulate", action="store_true",
+                        help="Use simulated sensors, no hardware access")
+    parser.add_argument("--sim-output", default=None,
+                        help="Local packet file path, required with --simulate")
+    parser.add_argument("--sim-count", type=int, default=1,
+                        help="Number of packets to emit in simulation")
     parser.add_argument("--rs485-port", default=DEFAULT_RS485_PORT)
     parser.add_argument("--esp32-port", default=DEFAULT_ESP32_PORT)
 
@@ -786,6 +813,11 @@ def main() -> int:
     )
 
     args = parser.parse_args()
+    if args.simulate:
+        if not args.sim_output or args.sim_count < 1:
+            parser.error("--simulate requires --sim-output and positive --sim-count")
+    elif args.sim_output is not None:
+        parser.error("--sim-output requires --simulate")
     if args.interval <= 0 or 86400 % args.interval:
         parser.error("--interval must be a positive divisor of 86400 for UTC alignment")
     if args.wind_sample_interval <= 0:
@@ -821,6 +853,7 @@ def main() -> int:
     sampler = None
 
     failed_cycles = 0
+    simulated_packets = 0
 
     try:
 
@@ -828,45 +861,29 @@ def main() -> int:
         # Open serial links
         # ----------------------------------------------------
 
-        log.info(
-            "Opening RS-485 port %s at %d baud",
-            args.rs485_port,
-            args.baud
-        )
-
-        rs485 = open_serial(
-            args.rs485_port,
-            args.baud,
-            timeout=1.0
-        )
-
-        log.info(
-            "Opening ESP32 port %s at %d baud",
-            args.esp32_port,
-            args.baud
-        )
-
-        esp32 = open_serial(
-            args.esp32_port,
-            args.baud,
-            timeout=1.0
-        )
-
-        # ----------------------------------------------------
-        # Create Modbus/sensor objects
-        # ----------------------------------------------------
-
-        modbus = ModbusRTU(rs485)
-
-        wind_sensor = WindSensor(
-            modbus,
-            slave=args.wind_slave
-        )
-
-        rain_sensor = RainSensor(
-            modbus,
-            slave=args.rain_slave
-        )
+        if args.simulate:
+            log.info("SIMULATION: no UART, I2C or TFT access")
+            wind_sensor = SimulatedWindSensor()
+            rain_sensor = SimulatedRainSensor()
+            esp32 = PacketFile(args.sim_output)
+        else:
+            from ina226 import INA226
+            from stationio.ili9488 import ILI9488
+            global ina, tft
+            ina = INA226(shunt_ohms=SHUNT_OHMS,
+                         max_expected_amps=0.8, address=INA_ADDRESS)
+            ina.configure()
+            tft = ILI9488(rotation=0, spi_speed_hz=4_000_000)
+            tft.setup()
+            log.info("Opening RS-485 port %s at %d baud",
+                     args.rs485_port, args.baud)
+            rs485 = open_serial(args.rs485_port, args.baud, timeout=1.0)
+            log.info("Opening ESP32 port %s at %d baud",
+                     args.esp32_port, args.baud)
+            esp32 = open_serial(args.esp32_port, args.baud, timeout=1.0)
+            modbus = ModbusRTU(rs485)
+            wind_sensor = WindSensor(modbus, slave=args.wind_slave)
+            rain_sensor = RainSensor(modbus, slave=args.rain_slave)
 
         log.info("station.py started")
 
@@ -912,16 +929,14 @@ def main() -> int:
                 # Read optional DS18B20 temperatures
                 # ------------------------------------------------
 
-                sea_temp = read_ds18b20_temperature(
-                    args.sea_temp_device
-                )
+                sea_temp = (10.4 if args.simulate else
+                            read_ds18b20_temperature(args.sea_temp_device))
 
                 if sea_temp is None:
                     sea_temp = args.default_sea_temp
 
-                cabinet_temp = read_ds18b20_temperature(
-                    args.cabinet_temp_device
-                )
+                cabinet_temp = (18.0 if args.simulate else
+                                read_ds18b20_temperature(args.cabinet_temp_device))
 
                 if cabinet_temp is None:
                     cabinet_temp = args.default_cabinet_temp
@@ -947,7 +962,8 @@ def main() -> int:
                 # Battery voltage
                 # ------------------------------------------------
 
-                station_batt = read_station_battery_voltage()
+                station_batt = (12.7 if args.simulate else
+                                read_station_battery_voltage())
 
                 if station_batt is None:
                     station_batt = args.default_station_battery
@@ -974,11 +990,9 @@ def main() -> int:
                 # Send to tft display
                 # ------------------------------------------------
 
-                update_tft_display(
-                    tft=tft,
-                    wx=wx,
-                    station_battery=station_batt,
-                )
+                if not args.simulate:
+                    update_tft_display(tft=tft, wx=wx,
+                                       station_battery=station_batt)
 
                 # ------------------------------------------------
                 # Send to ESP32
@@ -997,6 +1011,11 @@ def main() -> int:
                 failed_cycles = 0
 
                 log.info("Sent: %s", line.rstrip())
+                if args.simulate:
+                    simulated_packets += 1
+                    if simulated_packets >= args.sim_count:
+                        log.info("Simulation completed %d packets", simulated_packets)
+                        break
 
             except Exception as exc:
 
