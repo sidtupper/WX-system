@@ -13,7 +13,20 @@
 - Preserve packet schema for downstream ESP32 / gateway / WeeWX software.
 - Log sensor sample count and warn if coverage <90%.\n- Deliver completed intervals only on UTC 10-minute epoch boundaries; discard the first incomplete interval after startup.\n- Keep wind polling on a separate thread during rain, 1-Wire, TFT and ESP32 operations; serialize all Modbus operations with one lock.
 
-## Bench test (before deployment)\nRun `python3 -m unittest discover -s tests -p 'test_wind_timing.py' -v` from the repository root. This covers boundary math and continued polling during delayed consumption, not hardware performance. Verify clock synchronization before evaluating UTC timestamps; a significant clock step causes the current partial interval to be discarded. A full 600-second interval is required after the first UTC boundary.\n\n## Site procedure (March 2027)
+## Bench test (before deployment)\nRun `python3 -m unittest discover -s tests -p 'test_wind_timing.py' -v` from the repository root. This covers boundary math and continued polling during delayed consumption, not hardware performance. Verify clock synchronization before evaluating UTC timestamps; a significant clock step causes the current partial interval to be discarded. A full 600-second interval is required after the first UTC boundary.\n\n## Full-program simulation on station2 (no hardware access)
+From an experimental worktree on the feature branch, run:
+
+```bash
+python3 -m py_compile station/station_wind_gust.py station/wind_timing.py
+python3 station/station_wind_gust.py --simulate \
+    --sim-output /tmp/wx-wind-sim-packets.txt --sim-count 2 \
+    --interval 10 --wind-sample-interval 1 --log-level INFO
+cat /tmp/wx-wind-sim-packets.txt
+```
+
+The simulation uses deterministic wind/rain, 1-Wire temperatures and battery readings. It **never opens the real UART**, so `emulate_station.py` can continue running. The first partial UTC interval is discarded, and two full 10-second intervals are reported to a local packet file. Ten seconds is exclusively a fast test interval, not the intended production interval (600 seconds). Check that each packet has 11 comma-separated fields, valid CRC16, and a UTC epoch divisible by 10. The simulated speed spikes are periodic, so gusts vary by interval. This tests main-program integration, not RS-485/LoRa delivery or real sensor performance.
+
+## Site procedure (March 2027)
 1. Back up the **actual running** station Python script and service configuration, plus relevant configuration/environment. Compare the live station script with both `station/station.py` on `main` and this candidate: the repository version may be older than the deployed code. In particular, check INA226 shunt calibration, GPIO/UART settings, sensor ID mapping, GPS/time, TFT, and 10-minute reporting interval.
 2. Do **not** blindly overwrite the deployed `station.py`. Reconcile differences, and verify the candidate can import all dependencies.
 3. Stop the existing station service before launching the candidate: only one program can safely access the RS-485 and ESP32 UARTs.
