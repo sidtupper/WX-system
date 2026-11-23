@@ -74,4 +74,3 @@ class GatewayJsonDriver(weewx.drivers.AbstractDevice):
 
     def closePort(self):
         pass
-
